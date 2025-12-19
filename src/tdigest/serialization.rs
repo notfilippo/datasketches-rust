@@ -15,21 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! # Apache® DataSketches™ Core Rust Library Component
-//!
-//! The Sketching Core Library provides a range of stochastic streaming algorithms and closely
-//! related Rust technologies that are particularly useful when integrating this technology into
-//! systems that must deal with massive data.
-//!
-//! This library is divided into modules that constitute distinct groups of functionality.
-
-#![cfg_attr(docsrs, feature(doc_cfg))]
-#![deny(missing_docs)]
-
-// See https://github.com/apache/datasketches-rust/issues/28 for more information.
-#[cfg(target_endian = "big")]
-compile_error!("datasketches does not support big-endian targets");
-
-pub mod error;
-pub mod hll;
-pub mod tdigest;
+pub(super) const PREAMBLE_LONGS_EMPTY_OR_SINGLE: u8 = 1;
+pub(super) const PREAMBLE_LONGS_MULTIPLE: u8 = 2;
+pub(super) const SERIAL_VERSION: u8 = 1;
+pub(super) const TDIGEST_FAMILY_ID: u8 = 20;
+pub(super) const FLAGS_IS_EMPTY: u8 = 1 << 0;
+pub(super) const FLAGS_IS_SINGLE_VALUE: u8 = 1 << 1;
+pub(super) const FLAGS_REVERSE_MERGE: u8 = 1 << 2;
+/// the format of the reference implementation is using double (f64) precision
+pub(super) const COMPAT_DOUBLE: u32 = 1;
+/// the format of the reference implementation is using float (f32) precision
+pub(super) const COMPAT_FLOAT: u32 = 2;
