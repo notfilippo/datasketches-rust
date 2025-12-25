@@ -34,6 +34,10 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.number || github.run_id }}
   cancel-in-progress: true
+
+env:
+  RUST_BACKTRACE: 1
+
 jobs:
   check:
     name: Check
@@ -49,12 +53,7 @@ jobs:
         with:
           tool: typos-cli,taplo-cli,hawkeye
       - name: Check all
-        run: |
-          hawkeye check
-          taplo format --check
-          typos
-          cargo +nightly fmt --all -- --check
-          cargo +nightly clippy --all-targets --all-features -- -D warnings
+        run: cargo x lint
 
   msrv:
     name: Resolve MSRV
@@ -65,7 +64,7 @@ jobs:
       - uses: actions/checkout@v6
       - id: metadata
         run: |
-          msrv=$(yq '.package.rust-version' Cargo.toml)
+          msrv=$(yq '.workspace.package.rust-version' Cargo.toml)
           echo "MSRV: $msrv"
           echo "rust-versions=[\"${msrv}\", \"stable\"]" >> "$GITHUB_OUTPUT"
 
@@ -94,16 +93,18 @@ jobs:
       - name: Prepare test data
         shell: bash
         run: ./tools/generate_serialization_test_data.py
-      - name: Build
-        run: cargo build --workspace --all-features --bins --tests --examples --benches --lib
       - name: Run unit tests
         shell: bash
-        run: cargo test --all-features -- --nocapture
+        run: cargo x test
       - name: Run examples
         shell: bash
+        working-directory: examples
         run: |
           set -x
-          cargo run --example hll_usage
+          EXAMPLES=( hll_update )
+          for example in $EXAMPLES; do
+            cargo run --bin "$example"
+          done
 
   required:
     name: Required
