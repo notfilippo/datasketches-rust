@@ -30,9 +30,9 @@
 
 use std::hash::Hash;
 
+use crate::common::NumStdDev;
 use crate::hll::HllSketch;
 use crate::hll::HllType;
-use crate::hll::NumStdDev;
 use crate::hll::array4::Array4;
 use crate::hll::array6::Array6;
 use crate::hll::array8::Array8;

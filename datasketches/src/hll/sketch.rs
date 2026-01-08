@@ -23,9 +23,9 @@
 use std::hash::Hash;
 
 use crate::codec::SketchSlice;
+use crate::common::NumStdDev;
 use crate::error::Error;
 use crate::hll::HllType;
-use crate::hll::NumStdDev;
 use crate::hll::RESIZE_DENOMINATOR;
 use crate::hll::RESIZE_NUMERATOR;
 use crate::hll::array4::Array4;

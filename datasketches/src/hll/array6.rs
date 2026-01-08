@@ -23,8 +23,8 @@
 
 use crate::codec::SketchBytes;
 use crate::codec::SketchSlice;
+use crate::common::NumStdDev;
 use crate::error::Error;
-use crate::hll::NumStdDev;
 use crate::hll::estimator::HipEstimator;
 use crate::hll::get_slot;
 use crate::hll::get_value;
