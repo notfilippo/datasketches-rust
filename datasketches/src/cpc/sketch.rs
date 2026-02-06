@@ -17,6 +17,8 @@
 
 use std::hash::Hash;
 
+use crate::codec::SketchBytes;
+use crate::codec::SketchSlice;
 use crate::common::NumStdDev;
 use crate::common::canonical_double;
 use crate::common::inv_pow2_table::INVERSE_POWERS_OF_2;
@@ -24,6 +26,7 @@ use crate::cpc::DEFAULT_LG_K;
 use crate::cpc::Flavor;
 use crate::cpc::MAX_LG_K;
 use crate::cpc::MIN_LG_K;
+use crate::cpc::compression::CompressedState;
 use crate::cpc::count_bits_set_in_matrix;
 use crate::cpc::determine_correct_offset;
 use crate::cpc::determine_flavor;
@@ -34,8 +37,11 @@ use crate::cpc::estimator::icon_confidence_ub;
 use crate::cpc::estimator::icon_estimate;
 use crate::cpc::kxp_byte_lookup::KXP_BYTE_TABLE;
 use crate::cpc::pair_table::PairTable;
+use crate::error::Error;
+use crate::error::ErrorKind;
 use crate::hash::DEFAULT_UPDATE_SEED;
 use crate::hash::MurmurHash3X64128;
+use crate::hash::compute_seed_hash;
 
 /// A Compressed Probabilistic Counting sketch.
 ///
@@ -94,7 +100,7 @@ impl CpcSketch {
     /// Panics if `lg_k` is not in the range `[4, 16]`.
     pub fn with_seed(lg_k: u8, seed: u64) -> Self {
         assert!(
-            (MIN_LG_K..=MAX_LG_K).contains(&(lg_k as usize)),
+            (MIN_LG_K..=MAX_LG_K).contains(&lg_k),
             "lg_k out of range; got {lg_k}",
         );
 
@@ -426,6 +432,239 @@ impl CpcSketch {
     }
 }
 
+const SERIAL_VERSION: u8 = 1;
+const CPC_FAMILY_ID: u8 = 16;
+const FLAG_COMPRESSED: u8 = 1;
+const FLAG_HAS_HIP: u8 = 2;
+const FLAG_HAS_TABLE: u8 = 3;
+const FLAG_HAS_WINDOW: u8 = 4;
+
+impl CpcSketch {
+    /// Serializes this CpcSketch to bytes.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut bytes = SketchBytes::with_capacity(256);
+
+        let mut compressed = CompressedState::default();
+        compressed.compress(self);
+
+        let has_hip = !self.merge_flag;
+        let has_table = !compressed.table_data.is_empty();
+        let has_window = !compressed.window_data.is_empty();
+        let preamble_ints = make_preamble_ints(self.num_coupons, has_hip, has_table, has_window);
+        bytes.write_u8(preamble_ints);
+        bytes.write_u8(SERIAL_VERSION);
+        bytes.write_u8(CPC_FAMILY_ID);
+        bytes.write_u8(self.lg_k);
+        bytes.write_u8(self.first_interesting_column);
+        let flags = (1 << FLAG_COMPRESSED)
+            | (if has_hip { 1 } else { 0 } << FLAG_HAS_HIP)
+            | (if has_table { 1 } else { 0 } << FLAG_HAS_TABLE)
+            | (if has_window { 1 } else { 0 } << FLAG_HAS_WINDOW);
+        bytes.write_u8(flags);
+        let seed_hash = compute_seed_hash(self.seed);
+        bytes.write_u16_le(seed_hash);
+        if !self.is_empty() {
+            bytes.write_u32_le(self.num_coupons);
+            if has_table && has_window {
+                // if there is no window it is the same as number of coupons
+                bytes.write_u32_le(compressed.table_num_entries);
+                // HIP values can be in two different places in the sequence of fields
+                // this is the first HIP decision point
+                if has_hip {
+                    self.write_hip(&mut bytes);
+                }
+            }
+            if has_table {
+                debug_assert!(compressed.table_data_words <= u32::MAX as usize);
+                bytes.write_u32_le(compressed.table_data_words as u32);
+            }
+            if has_window {
+                debug_assert!(compressed.window_data_words <= u32::MAX as usize);
+                bytes.write_u32_le(compressed.window_data_words as u32);
+            }
+            // this is the second HIP decision point
+            if has_hip && !(has_table && has_window) {
+                self.write_hip(&mut bytes);
+            }
+            if has_window {
+                for i in 0..compressed.window_data_words {
+                    bytes.write_u32_le(compressed.window_data[i]);
+                }
+            }
+            if has_table {
+                for i in 0..compressed.table_data_words {
+                    bytes.write_u32_le(compressed.table_data[i]);
+                }
+            }
+        }
+        bytes.into_bytes()
+    }
+
+    /// Deserializes a CpcSketch from bytes.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, Error> {
+        Self::deserialize_with_seed(bytes, DEFAULT_UPDATE_SEED)
+    }
+
+    /// Deserializes a CpcSketch from bytes with the provided seed.
+    pub fn deserialize_with_seed(bytes: &[u8], seed: u64) -> Result<Self, Error> {
+        fn make_error(tag: &'static str) -> impl FnOnce(std::io::Error) -> Error {
+            move |_| Error::insufficient_data(tag)
+        }
+
+        let mut cursor = SketchSlice::new(bytes);
+        let preamble_ints = cursor.read_u8().map_err(make_error("preamble_ints"))?;
+        let serial_version = cursor.read_u8().map_err(make_error("serial_version"))?;
+        let family_id = cursor.read_u8().map_err(make_error("family_id"))?;
+        if family_id != CPC_FAMILY_ID {
+            return Err(Error::invalid_family(CPC_FAMILY_ID, family_id, "TDigest"));
+        }
+        if serial_version != SERIAL_VERSION {
+            return Err(Error::unsupported_serial_version(
+                SERIAL_VERSION,
+                serial_version,
+            ));
+        }
+
+        let lg_k = cursor.read_u8().map_err(make_error("lg_k"))?;
+        let first_interesting_column = cursor
+            .read_u8()
+            .map_err(make_error("first_interesting_column"))?;
+
+        let flags = cursor.read_u8().map_err(make_error("flags"))?;
+        let seed_hash = cursor.read_u16_le().map_err(make_error("seed_hash"))?;
+        let is_compressed = flags & (1 << FLAG_COMPRESSED) != 0;
+        if !is_compressed {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "only compressed sketches are supported",
+            ));
+        }
+        let has_hip = flags & (1 << FLAG_HAS_HIP) != 0;
+        let has_table = flags & (1 << FLAG_HAS_TABLE) != 0;
+        let has_window = flags & (1 << FLAG_HAS_WINDOW) != 0;
+
+        let mut compressed = CompressedState::default();
+        let mut num_coupons = 0;
+        let mut kxp = 0.0;
+        let mut hip_est_accum = 0.0;
+
+        if has_table || has_window {
+            num_coupons = cursor.read_u32_le().map_err(make_error("num_coupons"))?;
+            if has_table && has_window {
+                compressed.table_num_entries = cursor
+                    .read_u32_le()
+                    .map_err(make_error("table_num_entries"))?;
+                if has_hip {
+                    kxp = cursor.read_f64_le().map_err(make_error("kxp"))?;
+                    hip_est_accum = cursor.read_f64_le().map_err(make_error("hip_est_accum"))?;
+                }
+            }
+            if has_table {
+                compressed.table_data_words = cursor
+                    .read_u32_le()
+                    .map_err(make_error("table_data_words"))?
+                    as usize;
+            }
+            if has_window {
+                compressed.window_data_words = cursor
+                    .read_u32_le()
+                    .map_err(make_error("window_data_words"))?
+                    as usize;
+            }
+            if has_hip && !(has_table && has_window) {
+                kxp = cursor.read_f64_le().map_err(make_error("kxp"))?;
+                hip_est_accum = cursor.read_f64_le().map_err(make_error("hip_est_accum"))?;
+            }
+            if has_window {
+                for _ in 0..compressed.window_data_words {
+                    let word = cursor.read_u32_le().map_err(make_error("window_data"))?;
+                    compressed.window_data.push(word);
+                }
+            }
+            if has_table {
+                for _ in 0..compressed.table_data_words {
+                    let word = cursor.read_u32_le().map_err(make_error("table_data"))?;
+                    compressed.table_data.push(word);
+                }
+            }
+            if !has_window {
+                compressed.table_num_entries = num_coupons;
+            }
+        }
+
+        let expected_preamble_ints =
+            make_preamble_ints(num_coupons, has_hip, has_table, has_window);
+        if preamble_ints != expected_preamble_ints {
+            return Err(Error::invalid_preamble_longs(
+                expected_preamble_ints,
+                preamble_ints,
+            ));
+        }
+        if seed_hash != compute_seed_hash(seed) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "seed hash mismatch: expected {}, got {}",
+                    compute_seed_hash(seed),
+                    seed_hash
+                ),
+            ));
+        }
+        if !(MIN_LG_K..=MAX_LG_K).contains(&lg_k) {
+            return Err(Error::invalid_argument(format!(
+                "lg_k out of range; got {}",
+                lg_k
+            )));
+        }
+        if first_interesting_column > 63 {
+            return Err(Error::invalid_argument(format!(
+                "first_interesting_column out of range; got {}",
+                first_interesting_column
+            )));
+        }
+
+        let uncompressed = compressed.uncompress(lg_k, num_coupons);
+        Ok(CpcSketch {
+            lg_k,
+            seed,
+            first_interesting_column,
+            num_coupons,
+            surprising_value_table: Some(uncompressed.table),
+            window_offset: determine_correct_offset(lg_k, num_coupons),
+            sliding_window: uncompressed.window,
+            merge_flag: !has_hip,
+            kxp,
+            hip_est_accum,
+        })
+    }
+
+    fn write_hip(&self, bytes: &mut SketchBytes) {
+        bytes.write_f64_le(self.kxp);
+        bytes.write_f64_le(self.hip_est_accum);
+    }
+}
+
+fn make_preamble_ints(num_coupons: u32, has_hip: bool, has_table: bool, has_window: bool) -> u8 {
+    let mut preamble_ints = 2;
+    if num_coupons > 0 {
+        preamble_ints += 1; // number of coupons
+        if has_hip {
+            preamble_ints += 4; // HIP
+        }
+        if has_table {
+            preamble_ints += 1; // table data length
+            // number of values (if there is no window it is the same as number of coupons)
+            if has_window {
+                preamble_ints += 1;
+            }
+        }
+        if has_window {
+            preamble_ints += 1; // window length
+        }
+    }
+    preamble_ints
+}
+
 impl CpcSketch {
     /// Returns the estimated maximum compressed serialized size of a sketch.
     ///
@@ -438,7 +677,6 @@ impl CpcSketch {
     ///
     /// Panics if `lg_k` is not in the range `[4, 26]`.
     pub fn max_serialized_bytes(lg_k: u8) -> usize {
-        let lg_k = lg_k as usize;
         assert!(
             (MIN_LG_K..=MAX_LG_K).contains(&lg_k),
             "lg_k out of range; got {lg_k}",
@@ -450,7 +688,7 @@ impl CpcSketch {
         // This table does not include the worst-case space for the preamble, which is added
         // by the function.
         const MAX_PREAMBLE_SIZE_BYTES: usize = 40;
-        const EMPIRICAL_SIZE_MAX_LGK: usize = 19;
+        const EMPIRICAL_SIZE_MAX_LGK: u8 = 19;
         const EMPIRICAL_MAX_SIZE_FACTOR: f64 = 0.6; // 0.6 = 4.8 / 8.0
         static EMPIRICAL_MAX_SIZE_BYTES: [usize; 16] = [
             24,     // lg_k = 4
@@ -472,10 +710,11 @@ impl CpcSketch {
         ];
 
         if lg_k <= EMPIRICAL_SIZE_MAX_LGK {
-            return EMPIRICAL_MAX_SIZE_BYTES[lg_k - MIN_LG_K] + MAX_PREAMBLE_SIZE_BYTES;
+            EMPIRICAL_MAX_SIZE_BYTES[(lg_k - MIN_LG_K) as usize] + MAX_PREAMBLE_SIZE_BYTES
+        } else {
+            let k = 1 << lg_k;
+            ((EMPIRICAL_MAX_SIZE_FACTOR * k as f64) as usize) + MAX_PREAMBLE_SIZE_BYTES
         }
-        let k = 1 << lg_k;
-        ((EMPIRICAL_MAX_SIZE_FACTOR * k as f64) as usize) + MAX_PREAMBLE_SIZE_BYTES
     }
 }
 
