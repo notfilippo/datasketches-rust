@@ -15,19 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::codec::family::Family;
 use super::BloomFilter;
+use crate::codec::family::Family;
 use crate::hash::DEFAULT_UPDATE_SEED;
 
-const MIN_NUM_BITS: u64 = 1;
-const MAX_NUM_BITS: u64 = (i32::MAX as u64 - Family::BLOOMFILTER.max_pre_longs as u64) * 64;
+pub const MIN_NUM_BITS: u64 = 1;
+pub const MAX_NUM_BITS: u64 = (i32::MAX as u64 - Family::BLOOMFILTER.max_pre_longs as u64) * 64;
+pub const MIN_NUM_HASHES: u16 = 1;
+pub const MAX_NUM_HASHES: u16 = i16::MAX as u16;
 
 /// Builder for creating [`BloomFilter`] instances.
 ///
 /// Provides two construction modes:
 /// - [`with_accuracy()`](Self::with_accuracy): Specify target items and false positive rate
 ///   (recommended)
-/// - [`with_size()`](Self::with_size): Specify exact bit count and hash functions (manual)
+/// - [`with_size()`](Self::with_size): Specify requested bit count and hash functions (manual)
 #[derive(Debug, Clone)]
 pub struct BloomFilterBuilder {
     num_bits: u64,
@@ -48,7 +50,7 @@ impl BloomFilterBuilder {
     ///
     /// # Panics
     ///
-    /// Panics if `max_items` is 0 or `fpp` is not in (0.0, 1.0).
+    /// Panics if `max_items` is 0 or `fpp` is not in (0.0, 1.0].
     ///
     /// # Examples
     ///
@@ -62,8 +64,8 @@ impl BloomFilterBuilder {
     pub fn with_accuracy(max_items: u64, fpp: f64) -> Self {
         assert!(max_items > 0, "max_items must be greater than 0");
         assert!(
-            fpp > 0.0 && fpp < 1.0,
-            "fpp must be between 0.0 and 1.0 (exclusive)"
+            fpp > 0.0 && fpp <= 1.0,
+            "fpp must be between 0.0 and 1.0 (inclusive of 1.0)"
         );
 
         let num_bits = Self::suggest_num_bits(max_items, fpp);
@@ -78,8 +80,11 @@ impl BloomFilterBuilder {
 
     /// Creates a builder with manual size specification.
     ///
-    /// Use this when you want precise control over the filter size,
+    /// Use this when you want precise control over the requested filter size,
     /// or when working with pre-calculated parameters.
+    ///
+    /// The underlying storage is word-based, so the actual capacity is rounded
+    /// up to the next multiple of 64 bits.
     ///
     /// # Arguments
     ///
@@ -90,7 +95,7 @@ impl BloomFilterBuilder {
     ///
     /// Panics if any of:
     /// - `num_bits` < MIN_NUM_BITS or `num_bits` > MAX_NUM_BITS
-    /// - `num_hashes` < 1 or `num_hashes` > 100
+    /// - `num_hashes` < MIN_NUM_HASHES or `num_hashes` > MIN_NUM_HASHES
     ///
     /// # Examples
     ///
@@ -109,8 +114,16 @@ impl BloomFilterBuilder {
             "num_bits must not exceed {}",
             MAX_NUM_BITS
         );
-        assert!(num_hashes >= 1, "num_hashes must be at least 1");
-        assert!(num_hashes <= 100, "num_hashes must not exceed 100");
+        assert!(
+            num_hashes >= MIN_NUM_HASHES,
+            "num_hashes must be at least {}",
+            MIN_NUM_HASHES
+        );
+        assert!(
+            num_hashes <= MAX_NUM_HASHES,
+            "num_hashes must not exceed {}",
+            MAX_NUM_HASHES
+        );
 
         BloomFilterBuilder {
             num_bits,
@@ -142,16 +155,13 @@ impl BloomFilterBuilder {
     ///
     /// Panics if neither `with_accuracy()` nor `with_size()` was called.
     pub fn build(self) -> BloomFilter {
-        let capacity_bits = self.num_bits;
         let num_hashes = self.num_hashes;
-
-        let num_words = capacity_bits.div_ceil(64) as usize;
-        let bit_array = vec![0u64; num_words];
+        let num_words = self.num_bits.div_ceil(64) as usize;
+        let bit_array = vec![0u64; num_words].into_boxed_slice();
 
         BloomFilter {
             seed: self.seed,
             num_hashes,
-            capacity_bits,
             num_bits_set: 0,
             bit_array,
         }
@@ -176,9 +186,6 @@ impl BloomFilterBuilder {
 
         let bits = (-n * p.ln() / ln2_squared).ceil() as u64;
 
-        // Round up to multiple of 64 for efficiency
-        let bits = bits.div_ceil(64) * 64;
-
         bits.clamp(MIN_NUM_BITS, MAX_NUM_BITS)
     }
 
@@ -198,9 +205,9 @@ impl BloomFilterBuilder {
         let m = num_bits as f64;
         let n = max_items as f64;
 
-        let k = (m / n * std::f64::consts::LN_2).round();
-
-        (k as u16).clamp(1, 100) // Reasonable bounds
+        // Ceil to avoid selecting too few hashes.
+        let k = (m / n * std::f64::consts::LN_2).ceil();
+        k.clamp(f64::from(MIN_NUM_HASHES), f64::from(MAX_NUM_HASHES)) as u16
     }
 
     /// Suggests optimal number of hash functions from target FPP.
@@ -216,7 +223,9 @@ impl BloomFilterBuilder {
     /// assert_eq!(hashes, 7); // -log2(0.01) ≈ 6.64
     /// ```
     pub fn suggest_num_hashes_from_fpp(fpp: f64) -> u16 {
+        // Ceil to avoid selecting too few hashes.
         let k = -fpp.log2();
-        (k.round() as u16).clamp(1, 100)
+        k.ceil()
+            .clamp(f64::from(MIN_NUM_HASHES), f64::from(MAX_NUM_HASHES)) as u16
     }
 }

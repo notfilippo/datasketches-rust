@@ -72,7 +72,7 @@
 //!
 //! ## By Size (Manual)
 //!
-//! Specify exact bit count and hash functions:
+//! Specify requested bit count and hash functions (rounded up to a multiple of 64 bits):
 //!
 //! ```rust
 //! # use datasketches::bloom::BloomFilterBuilder;

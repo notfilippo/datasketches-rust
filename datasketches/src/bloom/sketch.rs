@@ -42,13 +42,10 @@ pub struct BloomFilter {
     pub(super) seed: u64,
     /// Number of hash functions to use (k)
     pub(super) num_hashes: u16,
-    /// Total number of bits in the filter (m)
-    pub(super) capacity_bits: u64,
     /// Count of bits set to 1 (for statistics)
     pub(super) num_bits_set: u64,
     /// Bit array packed into u64 words
-    /// Length = ceil(capacity_bits / 64)
-    pub(super) bit_array: Vec<u64>,
+    pub(super) bit_array: Box<[u64]>,
 }
 
 impl BloomFilter {
@@ -246,26 +243,10 @@ impl BloomFilter {
     /// // Now "apple" probably returns false, and most other items return true
     /// ```
     pub fn invert(&mut self) {
-        // Invert bits and count during operation (single pass)
-        let mut num_bits_set = 0;
         for word in &mut self.bit_array {
             *word = !*word;
-            num_bits_set += word.count_ones() as u64;
         }
-
-        // Mask off excess bits in the last word
-        let excess_bits = self.capacity_bits % 64;
-        if excess_bits != 0 {
-            let last_idx = self.bit_array.len() - 1;
-            let old_count = self.bit_array[last_idx].count_ones() as u64;
-            let mask = (1u64 << excess_bits) - 1;
-            self.bit_array[last_idx] &= mask;
-            let new_count = self.bit_array[last_idx].count_ones() as u64;
-            // Adjust count for masked-off bits
-            num_bits_set = num_bits_set - old_count + new_count;
-        }
-
-        self.num_bits_set = num_bits_set;
+        self.num_bits_set = self.capacity() as u64 - self.num_bits_set;
     }
 
     /// Returns whether the filter is empty (no items inserted).
@@ -281,8 +262,8 @@ impl BloomFilter {
     }
 
     /// Returns the total number of bits in the filter (capacity).
-    pub fn capacity(&self) -> u64 {
-        self.capacity_bits
+    pub fn capacity(&self) -> usize {
+        self.bit_array.len() * 64
     }
 
     /// Returns the number of hash functions used.
@@ -300,7 +281,7 @@ impl BloomFilter {
     /// Values near 0.5 indicate the filter is approaching saturation.
     /// Values above 0.5 indicate degraded false positive rates.
     pub fn load_factor(&self) -> f64 {
-        self.num_bits_set as f64 / self.capacity_bits as f64
+        self.num_bits_set as f64 / self.capacity() as f64
     }
 
     /// Estimates the current false positive probability.
@@ -327,8 +308,8 @@ impl BloomFilter {
     /// - Capacity (number of bits)
     /// - Number of hash functions
     /// - Seed
-    pub fn is_compatible(&self, other: &BloomFilter) -> bool {
-        self.capacity_bits == other.capacity_bits
+    pub fn is_compatible(&self, other: &Self) -> bool {
+        self.bit_array.len() == other.bit_array.len()
             && self.num_hashes == other.num_hashes
             && self.seed == other.seed
     }
@@ -374,8 +355,8 @@ impl BloomFilter {
 
         bytes.write_u64_le(self.seed);
 
-        // Bit array capacity stored as number of 64-bit words (int32) + unused padding (uint32)
-        let num_longs = (self.capacity_bits / 64) as i32;
+        // Bit array capacity is stored as number of 64-bit words (int32) + unused padding (uint32).
+        let num_longs = self.bit_array.len() as i32;
         bytes.write_i32_le(num_longs);
         bytes.write_u32_le(0); // unused
 
@@ -454,6 +435,13 @@ impl BloomFilter {
         let num_hashes = cursor
             .read_u16_le()
             .map_err(|_| Error::insufficient_data("num_hashes"))?;
+        if num_hashes == 0 || num_hashes > i16::MAX as u16 {
+            return Err(Error::deserial(format!(
+                "invalid num_hashes: expected [1, {}], got {}",
+                i16::MAX,
+                num_hashes
+            )));
+        }
         // Bytes 6-7: unused (u16)
         let _unused = cursor
             .read_u16_le()
@@ -462,17 +450,23 @@ impl BloomFilter {
             .read_u64_le()
             .map_err(|_| Error::insufficient_data("seed"))?;
 
-        // Bit array capacity stored as number of 64-bit words (int32) + unused padding (uint32)
+        // Bit array capacity is stored as number of 64-bit words (int32) + unused padding (uint32).
         let num_longs = cursor
             .read_i32_le()
-            .map_err(|_| Error::insufficient_data("num_longs"))? as u64;
+            .map_err(|_| Error::insufficient_data("num_longs"))?;
         let _unused = cursor
             .read_u32_le()
             .map_err(|_| Error::insufficient_data("unused"))?;
 
-        let capacity_bits = num_longs * 64; // Convert longs to bits
+        if num_longs <= 0 {
+            return Err(Error::deserial(format!(
+                "invalid num_longs: expected at least 1, got {}",
+                num_longs
+            )));
+        }
+
         let num_words = num_longs as usize;
-        let mut bit_array = vec![0u64; num_words];
+        let mut bit_array = vec![0u64; num_words].into_boxed_slice();
         let num_bits_set;
 
         if is_empty {
@@ -493,6 +487,14 @@ impl BloomFilter {
             if raw_num_bits_set == DIRTY_BITS_VALUE {
                 num_bits_set = bit_array.iter().map(|w| w.count_ones() as u64).sum();
             } else {
+                let raw_num_words_set = raw_num_bits_set.div_ceil(64) as usize;
+                if raw_num_words_set > num_words {
+                    return Err(Error::deserial(format!(
+                        "invalid num_bits_set: expected <= {}, got {}",
+                        num_words * 64,
+                        raw_num_bits_set
+                    )));
+                }
                 num_bits_set = raw_num_bits_set;
             }
         }
@@ -500,7 +502,6 @@ impl BloomFilter {
         Ok(BloomFilter {
             seed,
             num_hashes,
-            capacity_bits,
             num_bits_set,
             bit_array,
         })
@@ -552,22 +553,22 @@ impl BloomFilter {
     /// ```
     ///
     /// The right shift by 1 improves bit distribution. The index `i` is 1-based.
-    fn compute_bit_index(&self, h0: u64, h1: u64, i: u16) -> u64 {
-        let hash = h0.wrapping_add(u64::from(i).wrapping_mul(h1));
-        (hash >> 1) % self.capacity_bits
+    fn compute_bit_index(&self, h0: u64, h1: u64, i: u16) -> usize {
+        let hash = h0.wrapping_add(u64::from(i).wrapping_mul(h1)) as usize;
+        (hash >> 1) % self.capacity()
     }
 
     /// Gets the value of a single bit.
-    fn get_bit(&self, bit_index: u64) -> bool {
-        let word_index = (bit_index >> 6) as usize; // Equivalent to bit_index / 64
+    fn get_bit(&self, bit_index: usize) -> bool {
+        let word_index = bit_index >> 6; // Equivalent to bit_index / 64
         let bit_offset = bit_index & 63; // Equivalent to bit_index % 64
         let mask = 1u64 << bit_offset;
         (self.bit_array[word_index] & mask) != 0
     }
 
     /// Sets a single bit and updates the count if it wasn't already set.
-    fn set_bit(&mut self, bit_index: u64) {
-        let word_index = (bit_index >> 6) as usize; // Equivalent to bit_index / 64
+    fn set_bit(&mut self, bit_index: usize) {
+        let word_index = bit_index >> 6; // Equivalent to bit_index / 64
         let bit_offset = bit_index & 63; // Equivalent to bit_index % 64
         let mask = 1u64 << bit_offset;
 
@@ -596,6 +597,13 @@ mod tests {
         let filter = BloomFilterBuilder::with_size(1024, 5).build();
         assert_eq!(filter.capacity(), 1024);
         assert_eq!(filter.num_hashes(), 5);
+    }
+
+    #[test]
+    fn test_builder_with_size_rounds_to_word_boundary() {
+        let filter = BloomFilterBuilder::with_size(1, 3).build();
+        assert_eq!(filter.capacity(), 64);
+        assert_eq!(filter.num_hashes(), 3);
     }
 
     #[test]
