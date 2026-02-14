@@ -20,13 +20,11 @@ use std::hash::Hasher;
 
 use crate::codec::SketchBytes;
 use crate::codec::SketchSlice;
+use crate::codec::family::Family;
 use crate::error::Error;
 use crate::hash::XxHash64;
 
 // Serialization constants
-const PREAMBLE_LONGS_EMPTY: u8 = 3;
-const PREAMBLE_LONGS_STANDARD: u8 = 4;
-const BLOOM_FAMILY_ID: u8 = 21; // Bloom filter family ID
 const SERIAL_VERSION: u8 = 1;
 const EMPTY_FLAG_MASK: u8 = 1 << 2;
 
@@ -353,9 +351,9 @@ impl BloomFilter {
     pub fn serialize(&self) -> Vec<u8> {
         let is_empty = self.is_empty();
         let preamble_longs = if is_empty {
-            PREAMBLE_LONGS_EMPTY
+            Family::BLOOMFILTER.min_pre_longs
         } else {
-            PREAMBLE_LONGS_STANDARD
+            Family::BLOOMFILTER.max_pre_longs
         };
 
         let capacity = 8 * preamble_longs as usize
@@ -369,7 +367,7 @@ impl BloomFilter {
         // Preamble
         bytes.write_u8(preamble_longs); // Byte 0
         bytes.write_u8(SERIAL_VERSION); // Byte 1
-        bytes.write_u8(BLOOM_FAMILY_ID); // Byte 2
+        bytes.write_u8(Family::BLOOMFILTER.id); // Byte 2
         bytes.write_u8(if is_empty { EMPTY_FLAG_MASK } else { 0 }); // Byte 3: flags
         bytes.write_u16_le(self.num_hashes); // Bytes 4-5
         bytes.write_u16_le(0); // Bytes 6-7: unused
@@ -432,24 +430,22 @@ impl BloomFilter {
             .map_err(|_| Error::insufficient_data("flags"))?;
 
         // Validate
-        if family_id != BLOOM_FAMILY_ID {
-            return Err(Error::invalid_family(
-                BLOOM_FAMILY_ID,
-                family_id,
-                "BloomFilter",
-            ));
-        }
+        Family::BLOOMFILTER.validate_id(family_id)?;
         if serial_version != SERIAL_VERSION {
             return Err(Error::unsupported_serial_version(
                 SERIAL_VERSION,
                 serial_version,
             ));
         }
-        if preamble_longs != PREAMBLE_LONGS_EMPTY && preamble_longs != PREAMBLE_LONGS_STANDARD {
-            return Err(Error::invalid_preamble_longs(
-                PREAMBLE_LONGS_STANDARD,
-                preamble_longs,
-            ));
+        if !(Family::BLOOMFILTER.min_pre_longs..=Family::BLOOMFILTER.max_pre_longs)
+            .contains(&preamble_longs)
+        {
+            return Err(Error::deserial(format!(
+                "invalid preamble longs: expected [{}, {}], got {}",
+                Family::BLOOMFILTER.min_pre_longs,
+                Family::BLOOMFILTER.max_pre_longs,
+                preamble_longs
+            )));
         }
 
         let is_empty = (flags & EMPTY_FLAG_MASK) != 0;

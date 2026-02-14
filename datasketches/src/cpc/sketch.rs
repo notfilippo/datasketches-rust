@@ -19,6 +19,7 @@ use std::hash::Hash;
 
 use crate::codec::SketchBytes;
 use crate::codec::SketchSlice;
+use crate::codec::family::Family;
 use crate::common::NumStdDev;
 use crate::common::canonical_double;
 use crate::common::inv_pow2_table::INVERSE_POWERS_OF_2;
@@ -435,7 +436,6 @@ impl CpcSketch {
 }
 
 const SERIAL_VERSION: u8 = 1;
-const CPC_FAMILY_ID: u8 = 16;
 const FLAG_COMPRESSED: u8 = 1;
 const FLAG_HAS_HIP: u8 = 2;
 const FLAG_HAS_TABLE: u8 = 3;
@@ -455,7 +455,7 @@ impl CpcSketch {
         let preamble_ints = make_preamble_ints(self.num_coupons, has_hip, has_table, has_window);
         bytes.write_u8(preamble_ints);
         bytes.write_u8(SERIAL_VERSION);
-        bytes.write_u8(CPC_FAMILY_ID);
+        bytes.write_u8(Family::CPC.id);
         bytes.write_u8(self.lg_k);
         bytes.write_u8(self.first_interesting_column);
         let flags = (1 << FLAG_COMPRESSED)
@@ -517,9 +517,7 @@ impl CpcSketch {
         let preamble_ints = cursor.read_u8().map_err(make_error("preamble_ints"))?;
         let serial_version = cursor.read_u8().map_err(make_error("serial_version"))?;
         let family_id = cursor.read_u8().map_err(make_error("family_id"))?;
-        if family_id != CPC_FAMILY_ID {
-            return Err(Error::invalid_family(CPC_FAMILY_ID, family_id, "TDigest"));
-        }
+        Family::CPC.validate_id(family_id)?;
         if serial_version != SERIAL_VERSION {
             return Err(Error::unsupported_serial_version(
                 SERIAL_VERSION,

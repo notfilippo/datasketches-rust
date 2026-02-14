@@ -20,9 +20,9 @@ use std::hash::Hasher;
 
 use crate::codec::SketchBytes;
 use crate::codec::SketchSlice;
+use crate::codec::family::Family;
 use crate::countmin::CountMinValue;
 use crate::countmin::UnsignedCountMinValue;
-use crate::countmin::serialization::COUNTMIN_FAMILY_ID;
 use crate::countmin::serialization::FLAGS_IS_EMPTY;
 use crate::countmin::serialization::LONG_SIZE_BYTES;
 use crate::countmin::serialization::PREAMBLE_LONGS_SHORT;
@@ -279,7 +279,7 @@ impl<T: CountMinValue> CountMinSketch<T> {
 
         bytes.write_u8(PREAMBLE_LONGS_SHORT);
         bytes.write_u8(SERIAL_VERSION);
-        bytes.write_u8(COUNTMIN_FAMILY_ID);
+        bytes.write_u8(Family::COUNTMIN.id);
         bytes.write_u8(if self.is_empty() { FLAGS_IS_EMPTY } else { 0 });
         bytes.write_u32_le(0); // unused
 
@@ -349,13 +349,7 @@ impl<T: CountMinValue> CountMinSketch<T> {
         let flags = cursor.read_u8().map_err(make_error("flags"))?;
         cursor.read_u32_le().map_err(make_error("<unused>"))?;
 
-        if family_id != COUNTMIN_FAMILY_ID {
-            return Err(Error::invalid_family(
-                COUNTMIN_FAMILY_ID,
-                family_id,
-                "CountMinSketch",
-            ));
-        }
+        Family::COUNTMIN.validate_id(family_id)?;
         if serial_version != SERIAL_VERSION {
             return Err(Error::unsupported_serial_version(
                 SERIAL_VERSION,

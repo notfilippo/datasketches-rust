@@ -21,6 +21,7 @@ use std::num::NonZeroU64;
 
 use crate::codec::SketchBytes;
 use crate::codec::SketchSlice;
+use crate::codec::family::Family;
 use crate::error::Error;
 use crate::tdigest::serialization::*;
 
@@ -428,7 +429,7 @@ impl TDigestMut {
             _ => PREAMBLE_LONGS_MULTIPLE,
         });
         bytes.write_u8(SERIAL_VERSION);
-        bytes.write_u8(TDIGEST_FAMILY_ID);
+        bytes.write_u8(Family::TDIGEST.id);
         bytes.write_u16_le(self.k);
         bytes.write_u8({
             let mut flags = 0;
@@ -493,15 +494,11 @@ impl TDigestMut {
         let preamble_longs = cursor.read_u8().map_err(make_error("preamble_longs"))?;
         let serial_version = cursor.read_u8().map_err(make_error("serial_version"))?;
         let family_id = cursor.read_u8().map_err(make_error("family_id"))?;
-        if family_id != TDIGEST_FAMILY_ID {
+        if let Err(err) = Family::TDIGEST.validate_id(family_id) {
             return if preamble_longs == 0 && serial_version == 0 && family_id == 0 {
                 Self::deserialize_compat(bytes)
             } else {
-                Err(Error::invalid_family(
-                    TDIGEST_FAMILY_ID,
-                    family_id,
-                    "TDigest",
-                ))
+                Err(err)
             };
         }
         if serial_version != SERIAL_VERSION {
