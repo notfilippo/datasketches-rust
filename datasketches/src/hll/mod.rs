@@ -177,8 +177,35 @@ fn pack_coupon(slot: u32, value: u8) -> u32 {
     ((value as u32) << KEY_BITS_26) | (slot & KEY_MASK_26)
 }
 
-/// Generate a coupon from a hashable value.
-fn coupon<H: Hash>(v: H) -> u32 {
+/// Compute the HLL coupon for a hashable value.
+///
+/// A coupon is a compact 32-bit integer that encodes a bucket index (low 26 bits,
+/// derived from the low bits of a 128-bit MurmurHash) and a register value (high 6
+/// bits, derived from the leading-zero count of the high bits).  It is the internal
+/// currency of every HLL sketch.
+///
+/// Pre-computing coupons is useful when the same logical value must be inserted into
+/// multiple independent sketches, because the (relatively expensive) hash step is paid
+/// only once.  A common pattern is dictionary-encoded data: compute the coupon for each
+/// term id up front, cache it, and then call [`HllSketch::update_with_coupon`] for
+/// each per-bucket sketch rather than calling [`HllSketch::update`] repeatedly with the
+/// decoded string.
+///
+/// # Examples
+///
+/// ```
+/// # use datasketches::hll::{HllSketch, HllType, coupon};
+/// let c = coupon("hello");
+///
+/// let mut sketch1 = HllSketch::new(10, HllType::Hll8);
+/// let mut sketch2 = HllSketch::new(12, HllType::Hll8);
+/// sketch1.update_with_coupon(c);
+/// sketch2.update_with_coupon(c);
+///
+/// assert!(sketch1.estimate() >= 1.0);
+/// assert!(sketch2.estimate() >= 1.0);
+/// ```
+pub fn coupon<H: Hash>(v: H) -> u32 {
     let mut hasher = MurmurHash3X64128::default();
     v.hash(&mut hasher);
     let (lo, hi) = hasher.finish128();

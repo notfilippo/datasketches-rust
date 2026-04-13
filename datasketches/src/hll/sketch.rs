@@ -156,10 +156,15 @@ impl HllSketch {
         self.lg_config_k
     }
 
-    /// Update the sketch with a value
+    /// Update the sketch with a value.
     ///
-    /// This accepts any type that implements `Hash`. The value is hashed
-    /// and converted to a coupon, which is then inserted into the sketch.
+    /// Accepts any type that implements [`Hash`].  The value is hashed and converted to
+    /// an internal coupon, which is then inserted into the sketch.
+    ///
+    /// If you need to insert the same logical value into multiple sketches, consider
+    /// pre-computing the coupon with [`crate::hll::coupon`] and calling
+    /// [`update_with_coupon`](Self::update_with_coupon) on each sketch to avoid
+    /// redundant hashing.
     ///
     /// # Examples
     ///
@@ -175,9 +180,26 @@ impl HllSketch {
         self.update_with_coupon(coupon);
     }
 
-    /// Update the sketch with a raw coupon value
+    /// Update the sketch with a pre-computed coupon value.
     ///
-    /// Maintains all sketch invariants including mode transitions and estimator updates.
+    /// A coupon is the 32-bit internal representation produced by [`crate::hll::coupon`]:
+    /// the low 26 bits identify the HLL bucket and the high 6 bits carry the register
+    /// value.  Accepting a raw coupon makes it possible to pay the hashing cost once and
+    /// then fan the result out to many independent sketches — see [`crate::hll::coupon`]
+    /// for a worked example.
+    ///
+    /// Handles all internal bookkeeping, including automatic mode transitions
+    /// (List → Set → HLL array) and estimator state updates.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use datasketches::hll::{HllSketch, HllType, coupon};
+    /// let c = coupon("apple");
+    /// let mut sketch = HllSketch::new(10, HllType::Hll8);
+    /// sketch.update_with_coupon(c);
+    /// assert!(sketch.estimate() >= 1.0);
+    /// ```
     pub fn update_with_coupon(&mut self, coupon: u32) {
         match &mut self.mode {
             Mode::List { list, hll_type } => {
