@@ -82,13 +82,17 @@ impl List {
         empty: bool,
         compact: bool,
     ) -> Result<Self, Error> {
-        // Compute array size
-        let array_size = if compact { coupon_count } else { 1 << lg_arr };
+        // Always allocate the full-sized array (1 << lg_arr) so Coupon::EMPTY sentinel
+        // slots are available for future update() calls. In compact format only
+        // coupon_count values are stored on disk, but memory must hold the full capacity
+        // so the linear scan in update() can find an empty slot to insert into.
+        let array_size = 1 << lg_arr;
+        let read_count = if compact { coupon_count } else { array_size };
 
-        // Read coupons
+        // Read coupons into the front of the full-sized array; remaining slots stay Coupon::EMPTY.
         let mut coupons = vec![Coupon::EMPTY; array_size];
         if !empty && coupon_count > 0 {
-            for (i, coupon) in coupons.iter_mut().enumerate() {
+            for (i, coupon) in coupons.iter_mut().take(read_count).enumerate() {
                 let raw = cursor.read_u32_le().map_err(|_| {
                     Error::insufficient_data(format!(
                         "expect {coupon_count} coupons, failed at index {i}"
